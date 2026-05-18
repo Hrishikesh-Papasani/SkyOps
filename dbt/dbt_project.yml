@@ -1,0 +1,118 @@
+name: skyops
+version: "1.0.0"
+config-version: 2
+
+profile: skyops
+
+# All models written to skyops.gold schema on Databricks SQL Warehouse
+model-paths: ["models"]
+seed-paths: ["seeds"]
+test-paths: ["tests"]
+snapshot-paths: ["snapshots"]
+analysis-paths: ["analyses"]
+macro-paths: ["macros"]
+
+target-path: "target"
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+# Global model defaults
+models:
+  skyops:
+    # Staging: thin views over Silver tables — never materialised as tables
+    staging:
+      +materialized: view
+      +schema: gold   # Will resolve to skyops.gold.stg_*
+
+    # Marts: the Gold layer Star Schema
+    marts:
+      +materialized: table
+      +schema: gold
+
+      # fact_flights is incremental — overrides the table default above
+      fact_flights:
+        +materialized: incremental
+
+      # fct_delay_cascade is a large self-join — clustered for performance
+      fct_delay_cascade:
+        +materialized: table
+        +cluster_by:
+          - airline_code
+          - fl_date
+
+# Seeds: small reference tables loaded into skyops.gold
+seeds:
+  skyops:
+    +schema: gold
+    +quote_columns: false
+
+    airport_timezone:
+      +column_types:
+        iata_code: string
+        icao_code: string
+        timezone_str: string
+        utc_offset_standard: string
+        utc_offset_dst: string
+
+    airport_metadata:
+      +column_types:
+        iata_code: string
+        icao_code: string
+        airport_name: string
+        city: string
+        state_code: string
+        latitude: double
+        longitude: double
+        elevation_ft: integer
+        hub_classification: string
+        runway_count: integer
+
+    airline_metadata:
+      +column_types:
+        iata_code: string
+        airline_name: string
+        is_low_cost_carrier: boolean
+        alliance: string
+        dot_code: integer
+
+# Snapshots: SCD Type 2 for dim_airline (captures merger transitions)
+snapshots:
+  skyops:
+    +target_schema: gold
+    +strategy: timestamp
+    +updated_at: updated_at
+
+# Variables: used in models for configurability
+vars:
+  # Date range for dim_date spine
+  dim_date_start: "2019-01-01"
+  dim_date_end: "2023-12-31"
+
+  # COVID period flag in dim_date (used in analytical reports)
+  covid_period_start: "2020-03-15"
+  covid_period_end: "2021-06-01"
+
+  # Data freshness SLA: fail if max(fl_date) older than this
+  max_freshness_days: 40
+
+  # Incremental lookback window for fact_flights (handles late-arriving BTS corrections)
+  incremental_lookback_days: 35
+
+  # Delay threshold per BTS methodology (DELAY_DUE_* only populated above this)
+  delay_reporting_threshold_minutes: 15
+
+  # Quarantine tolerance: ±2 minutes allowed on delay component reconciliation
+  delay_reconciliation_tolerance_minutes: 2
+
+  # Visibility thresholds (nautical miles) for flight category classification
+  vfr_threshold_miles: 5.0
+  mvfr_lower_miles: 3.0
+  ifr_lower_miles: 1.0
+  # lifr = vsby < ifr_lower_miles
+
+on-run-start:
+  - "{{ log('SkyOps dbt run starting on target: ' ~ target.name, info=True) }}"
+
+on-run-end:
+  - "{{ log('SkyOps dbt run complete. Models: ' ~ results | length ~ ' processed.', info=True) }}"

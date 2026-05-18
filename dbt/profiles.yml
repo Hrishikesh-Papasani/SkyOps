@@ -1,0 +1,50 @@
+# dbt profiles.yml — Databricks SQL Warehouse connection
+#
+# SECURITY: This file is committed to git.
+# The `token` field reads from the DBT_TOKEN environment variable — NEVER hardcode.
+# Set DBT_TOKEN in your shell or in the Databricks Job spark_env_vars config.
+#
+# For Databricks Jobs (spark_env_vars in databricks.yml):
+#   DBT_TOKEN: "{{secrets/skyops-secrets/databricks_pat}}"
+#
+# For local CLI development:
+#   export DBT_TOKEN=$(databricks secrets get-bytes --scope skyops-secrets --key databricks_pat)
+
+skyops:
+  target: prod
+
+  outputs:
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # prod — Databricks SQL Warehouse (2X-Small Serverless)
+    # Used by: Lakeflow Jobs (skyops_gold_refresh), Power BI Import refresh
+    # ─────────────────────────────────────────────────────────────────────────
+    prod:
+      type: databricks
+      catalog: skyops
+      schema: gold
+      host: "{{ env_var('DATABRICKS_HOST') }}"
+      # HTTP path of your SQL Warehouse:
+      # Databricks UI → SQL Warehouses → <warehouse> → Connection details → HTTP path
+      http_path: "{{ env_var('DATABRICKS_HTTP_PATH') }}"
+      token: "{{ env_var('DBT_TOKEN') }}"
+      threads: 4
+      # Retry on transient SQL Warehouse connection errors (cold start)
+      connect_retries: 3
+      connect_timeout: 30
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # dev — Same warehouse, different schema for safe development
+    # Used by: local CLI during model development
+    # Writes to: skyops.gold_dev (separate from prod gold)
+    # ─────────────────────────────────────────────────────────────────────────
+    dev:
+      type: databricks
+      catalog: skyops
+      schema: gold_dev
+      host: "{{ env_var('DATABRICKS_HOST') }}"
+      http_path: "{{ env_var('DATABRICKS_HTTP_PATH') }}"
+      token: "{{ env_var('DBT_TOKEN') }}"
+      threads: 2
+      connect_retries: 3
+      connect_timeout: 30

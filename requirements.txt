@@ -1,0 +1,32 @@
+# SkyOps — Python Dependencies
+# Install: pip install -r requirements.txt
+
+# ── BTS Downloader (ingestion/bts_downloader.py) ──────────────────────────
+requests>=2.31.0          # HTTP client for BTS TranStats form interaction
+beautifulsoup4>=4.12.0    # HTML parsing for ASP.NET form state extraction
+lxml>=5.0.0               # Faster HTML parser (backend for BeautifulSoup)
+pandas>=2.0.0             # DataFrame operations and CSV I/O
+pyarrow>=14.0.0           # Parquet read/write for combined output file
+python-dateutil>=2.8.2    # relativedelta for calculating N-year date ranges
+
+# ── METAR Downloader (ingestion/metar_downloader.py) ──────────────────────
+# requests (already above)
+# pandas (already above)
+
+# ── Databricks (notebooks — installed in cluster, not locally) ─────────────
+# pyspark             # Installed on Databricks clusters
+# delta-spark         # Installed on Databricks clusters
+
+# ── dbt (Gold layer) ──────────────────────────────────────────────────────
+dbt-databricks>=1.7.0     # dbt adapter for Databricks SQL Warehouse
+dbt-core>=1.7.0           # dbt core (pulled in by dbt-databricks)
+
+# ── Data Quality ──────────────────────────────────────────────────────────
+great-expectations>=0.18.0  # GE checkpoint for Silver quality gate
+
+# ── Kafka Producer (streaming/kafka_producer.py) ──────────────────────────
+confluent-kafka>=2.3.0    # Confluent Cloud Kafka client
+fastavro>=1.9.0           # Avro serialisation for Schema Registry
+
+# ── Development utilities ─────────────────────────────────────────────────
+tqdm>=4.66.0              # Progress bars (optional, for long downloads)

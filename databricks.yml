@@ -1,0 +1,365 @@
+bundle:
+  name: skyops
+
+workspace:
+  host: ${var.databricks_host}
+  # Token resolved from environment or ~/.databrickscfg
+  # Never hardcode tokens here.
+
+variables:
+  databricks_host:
+    description: "Databricks workspace URL (e.g. https://adb-xxxx.azuredatabricks.net)"
+  cluster_policy_id:
+    description: "Serverless cluster policy ID for notebook tasks"
+    default: ""
+  notification_email:
+    description: "Email address for job failure alerts"
+
+targets:
+  dev:
+    mode: development
+    default: true
+    variables:
+      # Override in .databricks/dev.yml — do not commit secrets
+      notification_email: ""
+
+  prod:
+    mode: production
+    variables:
+      notification_email: ${var.notification_email}
+
+resources:
+  jobs:
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # JOB 1 — Monthly ingestion: raw file validation → Bronze
+    # Trigger: File arrival on /Volumes/skyops/raw/bts/
+    #          OR: Scheduled 10th of each month at 02:00 UTC
+    # ─────────────────────────────────────────────────────────────────────────
+    skyops_monthly_ingest:
+      name: skyops_monthly_ingest
+      description: >
+        Validates raw BTS and METAR files, lands them into Bronze Delta tables
+        (skyops.bronze.flights and skyops.bronze.weather), then triggers the
+        Silver quality job. Runs on file arrival or monthly schedule.
+
+      trigger:
+        # File arrival trigger — preferred path
+        file_arrival:
+          url: "/Volumes/skyops/raw/bts/"
+          min_time_between_trigger_seconds: 300
+
+      schedule:
+        # Fallback schedule if file arrival trigger is not available in tier
+        quartz_cron_expression: "0 0 2 10 * ?"
+        timezone_id: "UTC"
+
+      email_notifications:
+        on_failure:
+          - ${var.notification_email}
+        on_duration_warning_threshold_exceeded:
+          - ${var.notification_email}
+      health:
+        rules:
+          - metric: RUN_DURATION_SECONDS
+            op: GREATER_THAN
+            value: 7200  # Alert if job runs > 2 hours
+
+      max_concurrent_runs: 1
+
+      tasks:
+        - task_key: validate_raw_file
+          description: >
+            Check file size > 1MB and row count > 400,000.
+            Hard fail prevents Bronze job from running on empty/corrupt files.
+          notebook_task:
+            notebook_path: notebooks/quality/validate_raw_file
+            base_parameters:
+              volume_path: "/Volumes/skyops/raw/bts/"
+          new_cluster:
+            spark_version: "15.4.x-scala2.12"
+            node_type_id: "i3.xlarge"
+            num_workers: 0
+            enable_elastic_disk: true
+          retry_on_timeout: false
+          max_retries: 1
+          timeout_seconds: 300
+
+        - task_key: bronze_bts
+          description: "Land BTS CSVs into skyops.bronze.flights with explicit schema."
+          depends_on:
+            - task_key: validate_raw_file
+          notebook_task:
+            notebook_path: notebooks/bronze/bronze_bts
+            base_parameters:
+              pipeline_run_id: "{{job.run_id}}"
+          new_cluster:
+            spark_version: "15.4.x-scala2.12"
+            node_type_id: "i3.2xlarge"
+            num_workers: 4
+            autoscale:
+              min_workers: 2
+              max_workers: 8
+          retry_on_timeout: true
+          max_retries: 3
+          min_retry_interval_millis: 60000
+          timeout_seconds: 3600
+
+        - task_key: bronze_metar
+          description: "Land METAR CSVs into skyops.bronze.weather with explicit schema."
+          depends_on:
+            - task_key: validate_raw_file
+          notebook_task:
+            notebook_path: notebooks/bronze/bronze_metar
+            base_parameters:
+              pipeline_run_id: "{{job.run_id}}"
+          new_cluster:
+            spark_version: "15.4.x-scala2.12"
+            node_type_id: "i3.xlarge"
+            num_workers: 2
+          retry_on_timeout: true
+          max_retries: 3
+          min_retry_interval_millis: 60000
+          timeout_seconds: 1800
+
+        - task_key: trigger_silver
+          description: "Trigger skyops_silver_quality job via Jobs API after Bronze completes."
+          depends_on:
+            - task_key: bronze_bts
+            - task_key: bronze_metar
+          run_job_task:
+            job_id: ${resources.jobs.skyops_silver_quality.id}
+            job_parameters:
+              triggering_run_id: "{{job.run_id}}"
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # JOB 2 — Silver quality: business rules → quarantine → GE checkpoint
+    # Trigger: Triggered by Job 1 only (not scheduled independently)
+    # ─────────────────────────────────────────────────────────────────────────
+    skyops_silver_quality:
+      name: skyops_silver_quality
+      description: >
+        Applies all Silver business rules (cancellation split, reconciliation
+        check, impossible-value rejection, METAR join), runs Great Expectations
+        checkpoint, and triggers Gold refresh only if quarantine rate <= 0.5%.
+
+      email_notifications:
+        on_failure:
+          - ${var.notification_email}
+
+      max_concurrent_runs: 1
+
+      tasks:
+        - task_key: silver_flights
+          description: >
+            6-step Silver transformation on skyops.bronze.flights.
+            Outputs: silver.flights, silver.cancellations, silver.quarantine.
+          notebook_task:
+            notebook_path: notebooks/silver/silver_flights
+            base_parameters:
+              pipeline_run_id: "{{job.run_id}}"
+          new_cluster:
+            spark_version: "15.4.x-scala2.12"
+            node_type_id: "i3.2xlarge"
+            num_workers: 4
+            autoscale:
+              min_workers: 2
+              max_workers: 8
+          retry_on_timeout: true
+          max_retries: 2
+          min_retry_interval_millis: 120000
+          timeout_seconds: 5400
+
+        - task_key: silver_weather
+          description: "Clean and standardise METAR data into skyops.silver.weather."
+          notebook_task:
+            notebook_path: notebooks/silver/silver_weather
+            base_parameters:
+              pipeline_run_id: "{{job.run_id}}"
+          new_cluster:
+            spark_version: "15.4.x-scala2.12"
+            node_type_id: "i3.xlarge"
+            num_workers: 2
+          retry_on_timeout: true
+          max_retries: 2
+          min_retry_interval_millis: 120000
+          timeout_seconds: 1800
+
+        - task_key: great_expectations_check
+          description: >
+            Runs GE checkpoint on skyops.silver.flights.
+            Fails this task (and blocks trigger_gold) if quarantine_rate > 0.5%.
+          depends_on:
+            - task_key: silver_flights
+            - task_key: silver_weather
+          notebook_task:
+            notebook_path: notebooks/quality/great_expectations_check
+            base_parameters:
+              pipeline_run_id: "{{job.run_id}}"
+          new_cluster:
+            spark_version: "15.4.x-scala2.12"
+            node_type_id: "i3.xlarge"
+            num_workers: 0
+          retry_on_timeout: false
+          max_retries: 0
+          timeout_seconds: 600
+
+        - task_key: log_quality_metrics
+          description: "Write run statistics to skyops.silver.quality_runs."
+          depends_on:
+            - task_key: great_expectations_check
+          notebook_task:
+            notebook_path: notebooks/quality/log_quality_metrics
+            base_parameters:
+              pipeline_run_id: "{{job.run_id}}"
+          new_cluster:
+            spark_version: "15.4.x-scala2.12"
+            node_type_id: "i3.xlarge"
+            num_workers: 0
+          timeout_seconds: 300
+
+        - task_key: trigger_gold
+          description: "Trigger skyops_gold_refresh only if GE checkpoint passed."
+          depends_on:
+            - task_key: log_quality_metrics
+          run_job_task:
+            job_id: ${resources.jobs.skyops_gold_refresh.id}
+            job_parameters:
+              triggering_run_id: "{{job.run_id}}"
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # JOB 3 — Gold refresh: dbt run → dbt test → freshness check
+    # Trigger: Triggered by Job 2 completion (GE passed)
+    # ─────────────────────────────────────────────────────────────────────────
+    skyops_gold_refresh:
+      name: skyops_gold_refresh
+      description: >
+        Runs dbt (fact_flights incremental + all dims), executes dbt tests,
+        checks data freshness, and writes a completion marker to
+        skyops.gold.pipeline_status for Power BI last-refresh display.
+
+      email_notifications:
+        on_failure:
+          - ${var.notification_email}
+
+      max_concurrent_runs: 1
+
+      tasks:
+        - task_key: dbt_run
+          description: >
+            Run full dbt DAG: +fact_flights+ (all upstream staging + all
+            downstream dims including fct_delay_cascade).
+          notebook_task:
+            notebook_path: notebooks/gold/dbt_run
+            base_parameters:
+              dbt_select: "+fact_flights+"
+              pipeline_run_id: "{{job.run_id}}"
+          new_cluster:
+            spark_version: "15.4.x-scala2.12"
+            node_type_id: "i3.xlarge"
+            num_workers: 0
+            spark_env_vars:
+              DBT_TOKEN: "{{secrets/skyops-secrets/databricks_pat}}"
+          retry_on_timeout: false
+          max_retries: 0
+          timeout_seconds: 3600
+
+        - task_key: dbt_test
+          description: "Run all dbt schema tests. Fail task if any test fails."
+          depends_on:
+            - task_key: dbt_run
+          notebook_task:
+            notebook_path: notebooks/gold/dbt_test
+          new_cluster:
+            spark_version: "15.4.x-scala2.12"
+            node_type_id: "i3.xlarge"
+            num_workers: 0
+            spark_env_vars:
+              DBT_TOKEN: "{{secrets/skyops-secrets/databricks_pat}}"
+          retry_on_timeout: false
+          max_retries: 0
+          timeout_seconds: 1800
+
+        - task_key: dbt_docs_generate
+          description: "Regenerate dbt docs catalog after each successful Gold run."
+          depends_on:
+            - task_key: dbt_test
+          notebook_task:
+            notebook_path: notebooks/gold/dbt_docs_generate
+          new_cluster:
+            spark_version: "15.4.x-scala2.12"
+            node_type_id: "i3.xlarge"
+            num_workers: 0
+            spark_env_vars:
+              DBT_TOKEN: "{{secrets/skyops-secrets/databricks_pat}}"
+          timeout_seconds: 600
+
+        - task_key: data_freshness_check
+          description: >
+            Assert max(fl_date) in skyops.gold.fact_flights is within 40 days.
+            Fail task and send alert if stale.
+          depends_on:
+            - task_key: dbt_test
+          notebook_task:
+            notebook_path: notebooks/quality/data_freshness_check
+            base_parameters:
+              max_freshness_days: "40"
+          new_cluster:
+            spark_version: "15.4.x-scala2.12"
+            node_type_id: "i3.xlarge"
+            num_workers: 0
+          timeout_seconds: 300
+
+        - task_key: power_bi_refresh_notify
+          description: >
+            Write completion marker to skyops.gold.pipeline_status.
+            Power BI reads this table to display last-refresh timestamp.
+          depends_on:
+            - task_key: data_freshness_check
+            - task_key: dbt_docs_generate
+          notebook_task:
+            notebook_path: notebooks/gold/pipeline_status_update
+            base_parameters:
+              pipeline_run_id: "{{job.run_id}}"
+              status: "success"
+          new_cluster:
+            spark_version: "15.4.x-scala2.12"
+            node_type_id: "i3.xlarge"
+            num_workers: 0
+          timeout_seconds: 120
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # STREAMING JOB — Always-on Structured Streaming consumer
+    # Start separately. Not part of the batch pipeline chain.
+    # ─────────────────────────────────────────────────────────────────────────
+    skyops_streaming_consumer:
+      name: skyops_streaming_consumer
+      description: >
+        Reads from Confluent Cloud topic flights.departures using Spark
+        Structured Streaming. Computes 15-minute tumbling window aggregations
+        (on_time_rate per airline, avg dep_delay per origin, cancellation count).
+        Writes to skyops.gold.streaming_agg. Routes bad records to DLQ topic.
+
+      email_notifications:
+        on_failure:
+          - ${var.notification_email}
+
+      max_concurrent_runs: 1
+
+      tasks:
+        - task_key: streaming_consumer
+          notebook_task:
+            notebook_path: notebooks/streaming/streaming_consumer
+            base_parameters:
+              checkpoint_location: "/Volumes/skyops/checkpoints/streaming_consumer/"
+              kafka_topic: "flights.departures"
+              dlq_topic: "flights.departures.dlq"
+          new_cluster:
+            spark_version: "15.4.x-scala2.12"
+            node_type_id: "i3.xlarge"
+            num_workers: 2
+            spark_env_vars:
+              CONFLUENT_API_KEY: "{{secrets/skyops-secrets/confluent_api_key}}"
+              CONFLUENT_API_SECRET: "{{secrets/skyops-secrets/confluent_api_secret}}"
+          # Streaming job — no timeout
+          timeout_seconds: 0
