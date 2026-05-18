@@ -12,7 +12,7 @@ No Selenium or browser required. Uses requests + BeautifulSoup to:
   2. Calculate the start date (N years back from latest available).
   3. For each month: submit the form with the selected field checkboxes,
      download the ZIP, extract the CSV, rename columns to our schema.
-  4. Save per-month staging CSVs, then concatenate into a single output file.
+  4. Save per-month staging CSVs.
 
 FORM INTERACTION NOTE (ASP.NET WebForms):
   The BTS page uses ASP.NET WebForms state (__VIEWSTATE, __EVENTVALIDATION).
@@ -43,18 +43,16 @@ USAGE:
   # Re-download even if staging file exists
   python ingestion/bts_downloader.py --force
 
-  # Keep monthly files only, skip combining into single file
-  python ingestion/bts_downloader.py --no-combine
-
-  # Output CSV instead of Parquet (not recommended for large datasets)
-  python ingestion/bts_downloader.py --output-format csv
-
 REQUIREMENTS:
-  pip install requests beautifulsoup4 pandas pyarrow python-dateutil lxml
+  pip install requests beautifulsoup4 pandas python-dateutil lxml
 
 ESTIMATED RUNTIME:
   ~3-4 hours for 4 years (49 months) with 3-second polite delay per request.
   Resume is automatic: already-downloaded staging CSVs are skipped.
+
+OUTPUT:
+  Monthly staging CSVs in <output-dir>/staging/YYYY_MM.csv
+  To create a Delta table, use PySpark in a Databricks notebook.
 """
 
 import argparse
@@ -270,10 +268,15 @@ def setup_logging(verbose: bool = False) -> logging.Logger:
     level = logging.DEBUG if verbose else logging.INFO
     # Force UTF-8 on Windows stdout to avoid UnicodeEncodeError on
     # non-ASCII characters in log messages when piping output.
-    import io
-    stream = io.TextIOWrapper(
-        sys.stdout.buffer, encoding="utf-8", errors="replace"
-    ) if hasattr(sys.stdout, "buffer") else sys.stdout
+    try:
+        import io
+        stream = io.TextIOWrapper(
+            sys.stdout.buffer, encoding="utf-8", errors="replace"
+        ) if hasattr(sys.stdout, "buffer") else sys.stdout
+    except Exception:
+        # Fallback for environments without buffer attribute (Databricks)
+        stream = sys.stdout
+    
     logging.basicConfig(
         format="%(asctime)s [%(levelname)-8s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
@@ -715,50 +718,6 @@ def refresh_year_state(
     return state
 
 
-def combine_staging_files(
-    staging_dir: Path,
-    output_path: Path,
-    logger: logging.Logger,
-) -> int:
-    """
-    Read all monthly staging CSVs in staging_dir, concatenate them, and
-    write to output_path (.parquet or .csv based on file extension).
-
-    Returns total row count. Files are sorted by filename (YYYY_MM.csv)
-    so the combined output is chronologically ordered.
-    """
-    csv_files = sorted(staging_dir.glob("*.csv"))
-    if not csv_files:
-        raise FileNotFoundError(
-            f"No staging CSV files found in {staging_dir}. "
-            "Run without --no-combine after downloading data."
-        )
-
-    logger.info(
-        "Combining %d monthly files into: %s", len(csv_files), output_path
-    )
-
-    frames = []
-    for csv_path in csv_files:
-        df = pd.read_csv(csv_path, low_memory=False)
-        frames.append(df)
-        logger.debug("  Read %s: %d rows", csv_path.name, len(df))
-
-    combined = pd.concat(frames, ignore_index=True)
-    total_rows = len(combined)
-    logger.info("Combined total: {:,} rows".format(total_rows))
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    if output_path.suffix == ".parquet":
-        combined.to_parquet(output_path, index=False, engine="pyarrow")
-    else:
-        combined.to_csv(output_path, index=False)
-
-    size_mb = output_path.stat().st_size / 1024 / 1024
-    logger.info("Written: %s (%.1f MB)", output_path, size_mb)
-    return total_rows
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # CLI ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
@@ -769,13 +728,21 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  # Download 4 years to local directory
   python ingestion/bts_downloader.py
+
+  # Write to Databricks Volume staging area
+  python ingestion/bts_downloader.py --years 4 \\
+    --output-dir /Volumes/skyops/raw/bts
+
+  # Single month test
+  python ingestion/bts_downloader.py --month 2024-01 --output-dir ./data/raw/bts
+  
+  # Resume interrupted download
   python ingestion/bts_downloader.py --years 4 --output-dir ./data/raw/bts
-  python ingestion/bts_downloader.py --output-dir /Volumes/skyops/raw/bts
-  python ingestion/bts_downloader.py --month 2023-06
-  python ingestion/bts_downloader.py --force
-  python ingestion/bts_downloader.py --no-combine
-  python ingestion/bts_downloader.py --output-format csv
+  
+  # Force re-download
+  python ingestion/bts_downloader.py --month 2024-06 --force
         """,
     )
     parser.add_argument(
@@ -790,8 +757,7 @@ Examples:
         "--output-dir", type=str, default="./data/raw/bts",
         help=(
             "Root output directory. Monthly staging CSVs go in "
-            "<output-dir>/staging/YYYY_MM.csv. Combined file goes in "
-            "<output-dir>/. (default: ./data/raw/bts)"
+            "<output-dir>/staging/YYYY_MM.csv. (default: ./data/raw/bts)"
         ),
     )
     parser.add_argument(
@@ -804,25 +770,10 @@ Examples:
         ),
     )
     parser.add_argument(
-        "--output-format", choices=["parquet", "csv"], default="parquet",
-        help=(
-            "Format for the combined output file (default: parquet). "
-            "Parquet is strongly recommended for datasets > 1M rows."
-        ),
-    )
-    parser.add_argument(
         "--force", action="store_true",
         help=(
             "Re-download and overwrite staging CSVs even if they already exist. "
             "Without --force, existing staging files are skipped (resume mode)."
-        ),
-    )
-    parser.add_argument(
-        "--no-combine", action="store_true",
-        help=(
-            "Skip creating the combined output file. "
-            "Useful when you want monthly files only, or when running on a "
-            "machine without enough RAM to hold the full dataset."
         ),
     )
     parser.add_argument(
@@ -900,7 +851,7 @@ def main() -> None:
         len(month_range),
     )
     logger.info("Output directory: %s", output_dir.resolve())
-    logger.info("Output format: %s", args.output_format)
+    logger.info("Staging directory: %s", staging_dir.resolve())
     logger.info("-" * 60)
 
     # ── Step 3: Download each month ──────────────────────────────────────────
@@ -960,38 +911,15 @@ def main() -> None:
             "Failed months (re-run each with --month YYYY-MM --force):\n  %s",
             failed_str,
         )
-
-    # ── Step 5: Combine staging files into single output ─────────────────────
-    if args.no_combine:
-        logger.info(
-            "Skipped combining (--no-combine). "
-            "Monthly staging files in: %s", staging_dir,
-        )
-    elif successful:
-        start_label = f"{month_range[0][0]}_{month_range[0][1]:02d}"
-        end_label = f"{month_range[-1][0]}_{month_range[-1][1]:02d}"
-        out_filename = f"bts_ontime_{start_label}_{end_label}.{args.output_format}"
-        out_path = output_dir / out_filename
-
-        try:
-            total_rows = combine_staging_files(staging_dir, out_path, logger)
-            logger.info(
-                "Combined output: %s  ({:,} total rows)".format(total_rows),
-                out_path,
-            )
-        except Exception as exc:
-            logger.error(
-                "Failed to create combined output: %s\n"
-                "Monthly staging files are preserved in: %s",
-                exc, staging_dir,
-            )
-    else:
-        logger.warning(
-            "No months were successfully downloaded — "
-            "combined output not created."
-        )
-
+    
     logger.info("=" * 60)
+    logger.info("Staging CSVs saved to: %s", staging_dir.resolve())
+    logger.info("Total files: %d", len(successful))
+    logger.info("")
+    logger.info("Next step: Create Delta table from staging CSVs using PySpark")
+    logger.info("  in a Databricks notebook (subprocess cannot access Spark session)")
+    logger.info("=" * 60)
+    
     if failed:
         sys.exit(1)  # Non-zero exit so CI/Lakeflow Jobs detects partial failure
 
