@@ -13,7 +13,7 @@ The Silver layer applies:
 
 ## Input/Output
 
-**Input**: Bronze tables from `skyops.raw.*`  
+**Input**: Bronze tables from `skyops.bronze.*`  
 **Output**: Silver tables to `skyops.silver.*`  
 **Transformation**: Medium complexity (cleansing, validation, enrichment)
 

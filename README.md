@@ -9,7 +9,7 @@
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                          DATA SOURCES                                       │
-│  BTS On-Time Performance (Kaggle, 29M rows, 2019–2023)                     │
+│  BTS On-Time Performance (46.8M rows, Jan 2019–Feb 2026)                   │
 │  NOAA IEM METAR Weather (Iowa State, 15 airports, hourly)                  │
 │  FAA Airport 5010 Data (static reference)                                   │
 └───────────────────────┬─────────────────────────────────────────────────────┘
@@ -17,16 +17,17 @@
                         ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                    DATABRICKS VOLUMES (raw landing)                         │
-│  /Volumes/skyops/raw/bts/YYYY/    /Volumes/skyops/raw/metar/STATION/YYYY/  │
+│  /Volumes/skyops/bronze/bts/staging/    /Volumes/skyops/raw/metar/         │
 └───────────────────────┬─────────────────────────────────────────────────────┘
-                        │ File arrival trigger → Lakeflow Job 1
+                        │ Notebook → Lakeflow Job 1
                         ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │              BRONZE LAYER (skyops.bronze) — Delta Lake                      │
-│  skyops.bronze.flights        skyops.bronze.weather                         │
+│  skyops.bronze.bts_ontime     skyops.bronze.weather                         │
 │  Explicit PySpark schema      Explicit schema                               │
 │  Audit columns: _ingested_at, _source_file, _pipeline_run_id, _row_hash    │
-│  Partitioned: year / month    Partitioned: station / year                   │
+│  Partitioned: year            Partitioned: station / year                   │
+│  46.8M rows (86 months)       15 airports, hourly observations              │
 └───────────────────────┬─────────────────────────────────────────────────────┘
                         │ Lakeflow Job 2 (triggered by Job 1)
                         ▼
@@ -47,7 +48,7 @@
 │  fact_flights (incremental, merge, 35-day lookback)                         │
 │  dim_airline (SCD Type 2 snapshot — captures merger transitions)            │
 │  dim_airport (FAA 5010 + timezone seed)                                     │
-│  dim_date (2019–2023, US holidays, COVID period, peak travel flags)         │
+│  dim_date (2019–2026, US holidays, COVID period, peak travel flags)         │
 │  dim_weather_condition (VFR/MVFR/IFR/LIFR from METAR vsby)                 │
 │  fct_delay_cascade (self-join, airline × route × consecutive flight)        │
 └───────────────────────┬─────────────────────────────────────────────────────┘
@@ -106,16 +107,16 @@
 
 ## Data Sources
 
-### Primary: BTS On-Time Performance (2019–2023)
-- **Source:** [Kaggle — patrickzel/flight-delay-and-cancellation-dataset-2019-2023](https://www.kaggle.com/datasets/patrickzel/flight-delay-and-cancellation-dataset-2019-2023)
-- **Scale:** ~29 million rows across 5 annual CSV files
-- **Download:** `kaggle datasets download -d patrickzel/flight-delay-and-cancellation-dataset-2019-2023`
-- **Landing:** `/Volumes/skyops/raw/bts/YYYY/`
+### Primary: BTS On-Time Performance (Jan 2019–Feb 2026)
+- **Source:** BTS TranStats On-Time Performance API (direct download)
+- **Scale:** ~46.8 million rows across 86 months
+- **Landing:** `/Volumes/skyops/bronze/bts/staging/YYYY_MM.csv`
 - **Critical:** `DELAY_DUE_*` columns only populated when `ARR_DELAY >= 15`. Null ≠ zero.
+- **Coverage:** Jan 1, 2019 - Feb 28, 2026 (includes COVID-19 period)
 
 ### Enrichment: NOAA IEM METAR Weather
 - **Source:** Iowa State Mesonet — `https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py`
-- **Coverage:** 15 major US airports, hourly observations, 2019–2023
+- **Coverage:** 15 major US airports, hourly observations, Jan 2019–Feb 2026
 - **Landing:** `/Volumes/skyops/raw/metar/STATION/YYYY.csv`
 - **Join challenge:** METAR uses ICAO codes + UTC; BTS uses IATA codes + local time. Requires `dim_airport_timezone` seed for DST-safe join.
 
@@ -132,7 +133,7 @@
 1. Paid Databricks workspace (AWS `ap-south-1` or Azure `centralindia`)
 2. Unity Catalog metastore with `skyops` catalog
 3. Confluent Cloud cluster + API credentials
-4. Kaggle API credentials
+4. BTS TranStats access (no credentials required)
 
 ### Setup
 
@@ -151,8 +152,6 @@ databricks configure --token
 databricks secrets create-scope skyops-secrets
 databricks secrets put --scope skyops-secrets --key confluent_api_key
 databricks secrets put --scope skyops-secrets --key confluent_api_secret
-databricks secrets put --scope skyops-secrets --key kaggle_username
-databricks secrets put --scope skyops-secrets --key kaggle_key
 
 # 5. Deploy all jobs
 databricks bundle deploy
@@ -185,7 +184,7 @@ pip install dbt-databricks dbt-utils
 export DBT_TOKEN=<your-databricks-pat>
 
 dbt deps
-dbt seed                          # Load airport_timezone, airline_metadata, airport_metadata
+dbt seed              # Load airport_timezone, airline_metadata, airport_metadata
 dbt run --select +fact_flights+   # Run full Gold DAG
 dbt test                          # Run all tests
 dbt docs generate && dbt docs serve  # View lineage
@@ -215,7 +214,7 @@ skyops/
 │       └── data_freshness_check.py
 │
 ├── ingestion/
-│   ├── bts_downloader.py           # Kaggle API → Databricks Volume
+│   ├── bts_downloader.py           # BTS TranStats → Databricks Volume
 │   └── metar_downloader.py         # IEM API → Databricks Volume
 │
 ├── dbt/
@@ -288,6 +287,7 @@ skyops/
 5. **Southwest December 2022** — identifiable as statistical anomaly spike in the data
 6. **Route reliability** — std dev of `ARR_DELAY` reveals unreliable routes that mean-delay hides
 7. **Airborne recovery** — airlines differ significantly in recovering departure delays in the air
+8. **COVID-19 impact** — 2020 data shows 37% reduction in flight volume vs 2019 baseline
 
 ---
 
@@ -310,10 +310,10 @@ See [docs/report/cloud_cost_analysis.md](docs/report/cloud_cost_analysis.md) for
 
 | Phase | Weeks | Deliverable |
 |-------|-------|-------------|
-| 1 — Cloud Setup | 1–2 | Workspace running, 2022 data in Unity Catalog, Confluent green |
+| 1 — Cloud Setup | 1–2 | Workspace running, 2019 data in Unity Catalog, Confluent green |
 | 2 — Bronze + Silver | 3–4 | silver.flights + silver.quarantine populated, Incident #1 documented |
 | 3 — Gold + Streaming | 5–6 | dbt lineage graph, Confluent topic active, streaming_agg populating |
-| 4 — Orchestration + Full Load | 7–8 | 29M rows in fact_flights, all 3 jobs tested including failure path |
+| 4 — Orchestration + Full Load | 7–8 | 46.8M rows in fact_flights, all 3 jobs tested including failure path |
 | 5 — Power BI + Docs | 9–10 | .pbix committed, all ADRs + runbook + report complete, demo video linked |
 
 ---

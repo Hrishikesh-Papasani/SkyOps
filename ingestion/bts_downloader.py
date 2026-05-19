@@ -9,7 +9,7 @@ the BTS TranStats portal:
 
 No Selenium or browser required. Uses requests + BeautifulSoup to:
   1. Detect the latest available month from the page header dynamically.
-  2. Calculate the start date (N years back from latest available).
+  2. Calculate the start date (N years back from latest available OR explicit start month).
   3. For each month: submit the form with the selected field checkboxes,
      download the ZIP, extract the CSV, rename columns to our schema.
   4. Save per-month staging CSVs.
@@ -28,6 +28,9 @@ COLUMN MAPPING:
   ... (see RENAME_MAP below for full mapping)
 
 USAGE:
+  # Download from explicit start month to latest available
+  python ingestion/bts_downloader.py --start-month 2019-01 --output-dir ./data/raw/bts
+
   # Download last 4 years (default) to ./data/raw/bts/
   python ingestion/bts_downloader.py
 
@@ -35,7 +38,7 @@ USAGE:
   python ingestion/bts_downloader.py --years 4 --output-dir ./data/raw/bts
 
   # Write to Databricks Volume (run from within Databricks)
-  python ingestion/bts_downloader.py --output-dir /Volumes/skyops/raw/bts
+  python ingestion/bts_downloader.py --start-month 2019-01 --output-dir /Volumes/skyops/raw/bts
 
   # Single month (useful for backfill or retry)
   python ingestion/bts_downloader.py --month 2023-06
@@ -728,29 +731,40 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  # Download from explicit start month to latest available
+  python ingestion/bts_downloader.py --start-month 2019-01
+
   # Download 4 years to local directory
   python ingestion/bts_downloader.py
 
   # Write to Databricks Volume staging area
-  python ingestion/bts_downloader.py --years 4 \\
+  python ingestion/bts_downloader.py --start-month 2019-01 \\
     --output-dir /Volumes/skyops/raw/bts
 
   # Single month test
   python ingestion/bts_downloader.py --month 2024-01 --output-dir ./data/raw/bts
   
   # Resume interrupted download
-  python ingestion/bts_downloader.py --years 4 --output-dir ./data/raw/bts
+  python ingestion/bts_downloader.py --start-month 2019-01 --output-dir ./data/raw/bts
   
   # Force re-download
   python ingestion/bts_downloader.py --month 2024-06 --force
         """,
     )
     parser.add_argument(
+        "--start-month", type=str, default=None, metavar="YYYY-MM",
+        help=(
+            "Explicit start month (e.g. 2019-01). Downloads from this month "
+            "to the latest available month detected from BTS. Takes precedence "
+            "over --years when both are provided."
+        ),
+    )
+    parser.add_argument(
         "--years", type=int, default=4,
         help=(
             "Number of years to download, counting back from the latest "
             "available month (default: 4). The start date is calculated as "
-            "latest_available_date - N years."
+            "latest_available_date - N years. Ignored if --start-month is set."
         ),
     )
     parser.add_argument(
@@ -766,7 +780,7 @@ Examples:
         help=(
             "Download a single month only (e.g. 2023-06). "
             "Useful for backfill or retrying a failed month. "
-            "Ignores --years when set."
+            "Ignores --years and --start-month when set."
         ),
     )
     parser.add_argument(
@@ -819,6 +833,7 @@ def main() -> None:
 
     # ── Step 2: Determine date range ─────────────────────────────────────────
     if args.month:
+        # Single month mode
         try:
             sm_year, sm_month = map(int, args.month.split("-"))
             if not (1987 <= sm_year <= latest_year):
@@ -834,7 +849,28 @@ def main() -> None:
             logger.error("Invalid --month: %s", exc)
             sys.exit(1)
         month_range = [(sm_year, sm_month)]
+    elif args.start_month:
+        # Explicit start month mode (takes precedence over --years)
+        try:
+            sm_year, sm_month = map(int, args.start_month.split("-"))
+            if not (1987 <= sm_year <= latest_year):
+                raise ValueError(f"Year {sm_year} out of BTS range (1987-{latest_year})")
+            if not (1 <= sm_month <= 12):
+                raise ValueError(f"Month {sm_month} must be between 1 and 12")
+            if (sm_year, sm_month) > (latest_year, latest_month):
+                raise ValueError(
+                    f"{args.start_month} is after the latest available "
+                    f"({MONTH_NAMES[latest_month]} {latest_year})"
+                )
+        except (ValueError, AttributeError) as exc:
+            logger.error("Invalid --start-month: %s", exc)
+            sys.exit(1)
+        month_range = generate_month_range(
+            sm_year, sm_month,
+            latest_year, latest_month,
+        )
     else:
+        # Years-back mode (default)
         latest_date = date(latest_year, latest_month, 1)
         start_date = latest_date - relativedelta(years=args.years)
         month_range = generate_month_range(

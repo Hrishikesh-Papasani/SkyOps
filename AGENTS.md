@@ -8,7 +8,7 @@
 ## 1. Project Overview
 
 **SkyOps Flight Operations Intelligence Platform** — a portfolio data-engineering project
-that ingests 4 years of US domestic on-time performance data from the Bureau of
+that ingests 7+ years of US domestic on-time performance data (Jan 2019 - Feb 2026) from the Bureau of
 Transportation Statistics (BTS), enriches it with METAR weather observations, and
 delivers analytical Gold-layer models to Power BI.
 
@@ -68,7 +68,7 @@ SkyOps/
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| `ingestion/bts_downloader.py` | ✅ Complete & tested | Downloads 32-field BTS data, verified Jan 2024 (547,271 rows) |
+| `ingestion/bts_downloader.py` | ✅ Complete & tested | Downloads 32-field BTS data, verified across full date range |
 | `requirements.txt` | ✅ Complete | All dependencies declared |
 | `databricks.yml` | ✅ Complete | 4 Lakeflow Jobs as Asset Bundle |
 | `dbt/` config files | ✅ Complete | dbt_project.yml, profiles.yml, packages.yml |
@@ -77,6 +77,7 @@ SkyOps/
 | `docs/adr/` | ✅ Complete | 5 ADRs |
 | `README.md` | ✅ Complete | Full architecture + quickstart |
 | `.gitignore` | ✅ Complete | data/, dbt artefacts, secrets excluded |
+| Bronze Delta table | ✅ Complete | skyops.bronze.bts_ontime — 46.8M rows, Jan 2019 - Feb 2026 |
 
 ---
 
@@ -84,7 +85,7 @@ SkyOps/
 
 | Component | Priority | Notes |
 |-----------|----------|-------|
-| `ingestion/metar_downloader.py` | HIGH | IEM ASOS API, 15 airports, same date range as BTS |
+| `ingestion/metar_downloader.py` | HIGH | IEM ASOS API, 15 airports, Jan 2019 - Feb 2026 |
 | `dbt/models/staging/` | HIGH | STG models for Bronze→Silver transformation |
 | `dbt/models/marts/` | HIGH | dim_airport, dim_airline, dim_date, fct_flights, fct_delay_cascade |
 | Databricks notebooks | MEDIUM | Bronze ingestion PySpark notebook (reads from Volumes) |
@@ -99,7 +100,7 @@ SkyOps/
 |-------|-----------|------------|
 | Ingestion (local) | Python 3.13 + requests + BS4 | `ingestion/bts_downloader.py` |
 | Storage (cloud) | Databricks Unity Catalog | Catalog: `skyops`, schemas: `bronze`/`silver`/`gold` |
-| Raw landing | Unity Catalog Volumes | `/Volumes/skyops/raw/bts/` |
+| Raw landing | Unity Catalog Volumes | `/Volumes/skyops/bronze/bts/staging/` |
 | Transform | dbt Core + Databricks adapter | SQL Warehouse, `dbt run --target prod` |
 | Orchestration | Databricks Lakeflow Jobs | 4 jobs in `databricks.yml` |
 | Streaming | Confluent Cloud Kafka | Topic: `flights.departures` (6 partitions) |
@@ -167,21 +168,23 @@ RETRY_BACKOFF_BASE_SECONDS = 15
 ### CLI Usage
 ```bash
 # Single month test
-python ingestion/bts_downloader.py --month 2024-01 --output-dir ./data/raw/bts --no-combine
+python ingestion/bts_downloader.py --month 2024-01 --output-dir /Volumes/skyops/bronze/bts
 
-# Full 4-year download (~49 months, ~3-4 hours)
-python ingestion/bts_downloader.py --years 4 --output-dir ./data/raw/bts --output-format parquet
+# Download specific date range (e.g., backfill Jan 2019 - Jan 2022)
+python ingestion/bts_downloader.py --month 2019-01 --output-dir /Volumes/skyops/bronze/bts
+# ... repeat for each month or use a loop in the notebook
 
 # Resume interrupted download (skips already-downloaded months automatically)
-python ingestion/bts_downloader.py --years 4 --output-dir ./data/raw/bts --output-format parquet
+python ingestion/bts_downloader.py --month 2024-06 --output-dir /Volumes/skyops/bronze/bts
 
 # Force re-download a specific month
-python ingestion/bts_downloader.py --month 2024-06 --output-dir ./data/raw/bts --force
+python ingestion/bts_downloader.py --month 2024-06 --output-dir /Volumes/skyops/bronze/bts --force
 ```
 
 ### Output
-- **Staging CSVs**: `data/raw/bts/staging/YYYY_MM.csv` (one per month)
-- **Combined file**: `data/raw/bts/bts_ontime_YYYY_MM_YYYY_MM.parquet` (all months merged)
+- **Staging CSVs**: `/Volumes/skyops/bronze/bts/staging/YYYY_MM.csv` (one per month)
+- **Total coverage**: 86 months (Jan 2019 - Feb 2026)
+- **Total rows**: ~46.8M flights
 
 ---
 
@@ -191,7 +194,7 @@ When building `ingestion/metar_downloader.py`, use the IEM ASOS API:
 
 ```
 https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py
-  ?station=KATL&year1=2022&month1=2&day1=1
+  ?station=KATL&year1=2019&month1=1&day1=1
   &year2=2026&month2=2&day2=28
   &data=tmpf,vsby,sknt,p01i,wxcodes&tz=UTC&format=comma&latlon=no&direct=yes
 ```
@@ -202,6 +205,8 @@ KATL, KORD, KDEN, KDFW, KLAX, KJFK, KSFO, KLAS, KPHX, KMIA, KSEA, KMSP, KBOS, KD
 The timezone mapping for METAR→local join is in `dbt/seeds/airport_timezone.csv`.
 **Critical**: Use `UTC` for API requests, convert to local time in dbt using the seed file.
 
+**Date range**: Jan 1, 2019 - Feb 28, 2026 (match BTS coverage)
+
 ---
 
 ## 8. Databricks Schema & Data Flow
@@ -209,9 +214,9 @@ The timezone mapping for METAR→local join is in `dbt/seeds/airport_timezone.cs
 ```
 Local Script          Databricks Unity Catalog
 ──────────            ────────────────────────────────────────────────
-bts_downloader.py ──► /Volumes/skyops/raw/bts/YYYY_MM.parquet   (Bronze raw)
-                       ↓  (Lakeflow Job: skyops_monthly_ingest)
-                      skyops.bronze.bts_ontime_raw               (Delta table)
+bts_downloader.py ──► /Volumes/skyops/bronze/bts/staging/*.csv   (Raw CSVs)
+                       ↓  (Notebook: bronze/bts_ontime_ingest.py)
+                      skyops.bronze.bts_ontime                    (Delta table, 46.8M rows)
                        ↓  (Lakeflow Job: skyops_silver_quality)
                       skyops.silver.fct_flights_clean             (GE validated)
                        ↓  (Lakeflow Job: skyops_gold_refresh)
@@ -222,6 +227,12 @@ bts_downloader.py ──► /Volumes/skyops/raw/bts/YYYY_MM.parquet   (Bronze ra
                        ↓
                       Power BI (Import mode, SQL Warehouse)
 ```
+
+**Data Coverage**:
+- **Date range**: Jan 1, 2019 - Feb 28, 2026 (86 months)
+- **Total flights**: 46,822,552 rows
+- **Years covered**: 2019, 2020, 2021, 2022, 2023, 2024, 2025, 2026 (partial)
+- **COVID impact visible**: 2020 shows 37% reduction vs 2019
 
 ---
 
@@ -253,18 +264,20 @@ DBT_TOKEN=<databricks-personal-access-token>
 
 6. **METAR DST issue** (Incident #002 in runbook): METAR data is in UTC. The airport_timezone seed has both `utc_offset_standard` and `utc_offset_dst` columns. PHX correctly has UTC-7 for both (Arizona has no DST).
 
-7. **Databricks Volumes path**: When running the downloader output on Databricks, `--output-dir` must point to a DBFS or Volumes path, e.g., `/Volumes/skyops/raw/bts`. The `sys.stdout.buffer` wrapper in `setup_logging()` may fail on Databricks (no buffer attribute). Wrap the setup_logging call in a try/except that falls back to `sys.stdout` directly.
+7. **Databricks Volumes path**: When running the downloader output on Databricks, `--output-dir` must point to a DBFS or Volumes path, e.g., `/Volumes/skyops/bronze/bts`. The `sys.stdout.buffer` wrapper in `setup_logging()` may fail on Databricks (no buffer attribute). Wrap the setup_logging call in a try/except that falls back to `sys.stdout` directly.
+
+8. **BTS website changes**: The BTS TranStats website occasionally changes its layout. If the script fails with "Could not find 'Latest Available Data'", use the `--month` argument to specify exact months instead of relying on `--years` auto-detection.
 
 ---
 
 ## 11. dbt Models — What Needs To Be Built
 
 ### Staging layer (`skyops.silver`, materialized as `view`)
-- `stg_bts_flights.sql` — select + cast from `skyops.bronze.bts_ontime_raw`
+- `stg_bts_flights.sql` — select + cast from `skyops.bronze.bts_ontime`
 - `stg_metar_obs.sql` — select + cast from `skyops.bronze.metar_raw`
 
 ### Marts layer (`skyops.gold`, materialized as `table` or `incremental`)
-- `dim_date.sql` — date spine from 2022-01-01 to 2026-12-31
+- `dim_date.sql` — date spine from 2019-01-01 to 2026-12-31
 - `dim_airport.sql` — from `ref('airport_metadata')` seed
 - `dim_airline.sql` — from `ref('airline_metadata')` seed
 - `fct_flights.sql` — incremental, joins stg_bts_flights + stg_metar_obs, unique_key='flight_id'
@@ -272,7 +285,7 @@ DBT_TOKEN=<databricks-personal-access-token>
 
 ### dbt variables in scope (set in dbt_project.yml)
 ```yaml
-dim_date_start: "2022-01-01"
+dim_date_start: "2019-01-01"
 dim_date_end: "2026-12-31"
 delay_reporting_threshold_minutes: 15
 delay_reconciliation_tolerance_minutes: 2
@@ -284,24 +297,15 @@ max_freshness_days: 40
 
 ## 12. Suggested Next Steps (Priority Order)
 
-1. **Run full 4-year BTS download** (local machine, ~3-4 hrs):
-   ```bash
-   python ingestion/bts_downloader.py --years 4 --output-dir ./data/raw/bts --output-format parquet
-   ```
+1. **Build METAR downloader** (`ingestion/metar_downloader.py`) — IEM ASOS API, Jan 2019 - Feb 2026.
 
-2. **Upload parquet files to Databricks Volumes**:
-   ```bash
-   databricks fs cp data/raw/bts/bts_ontime_*.parquet dbfs:/Volumes/skyops/raw/bts/ --recursive
-   ```
-   Or use the Databricks UI (Catalog → Volumes → Upload).
-
-3. **Deploy Asset Bundle** to Databricks:
+2. **Deploy Asset Bundle** to Databricks:
    ```bash
    databricks bundle deploy --target prod
    ```
 
-4. **Build METAR downloader** (`ingestion/metar_downloader.py`) — IEM ASOS API.
+3. **Build dbt models** (staging → marts) following schema in section 11 above.
 
-5. **Build dbt models** (staging → marts) following schema in section 11 above.
+4. **Connect Power BI** to Databricks SQL Warehouse and build dashboards for the 4 business questions.
 
-6. **Connect Power BI** to Databricks SQL Warehouse and build dashboards for the 4 business questions.
+5. **Set up incremental refresh**: Configure Lakeflow Jobs to run monthly on new data arrivals.

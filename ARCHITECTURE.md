@@ -13,7 +13,7 @@ SkyOps follows the **Medallion Architecture** pattern for data lakehouse organiz
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                       BRONZE LAYER                              │
-│  📂 /SkyOps/bronze/        📊 skyops.raw.*                     │
+│  📂 /SkyOps/bronze/        📊 skyops.bronze.*                  │
 │  • bts_ontime_ingest.py    • bts_ontime                        │
 │                                                                  │
 │  Raw ingestion, minimal transformation                          │
@@ -58,7 +58,7 @@ SkyOps follows the **Medallion Architecture** pattern for data lakehouse organiz
 │   └── bts_downloader.py     # BTS API → CSV extractor
 │
 ├── bronze/                   # Bronze layer notebooks
-│   └── bts_ontime_ingest.py  # ✅ CSV → skyops.raw.bts_ontime
+│   └── bts_ontime_ingest.py  # ✅ CSV → skyops.bronze.bts_ontime
 │
 ├── silver/                   # Silver layer notebooks
 │   ├── README.md             # Silver layer documentation
@@ -85,9 +85,9 @@ SkyOps follows the **Medallion Architecture** pattern for data lakehouse organiz
 * Data quality issues are NOT fixed here (deferred to Silver)
 
 **Folder**: `/SkyOps/bronze/`  
-**Catalog Schema**: `skyops.raw`  
-**Table Naming**: `skyops.raw.<source>_<entity>`  
-**Example**: `skyops.raw.bts_ontime` (28M rows of raw BTS flight data)
+**Catalog Schema**: `skyops.bronze`  
+**Table Naming**: `skyops.bronze.<source>_<entity>`  
+**Example**: `skyops.bronze.bts_ontime` (28M rows of raw BTS flight data)
 
 **Implemented**:
 * ✅ `bts_ontime_ingest.py` - BTS flight data (Feb 2022 - Feb 2026)
@@ -154,13 +154,13 @@ SkyOps follows the **Medallion Architecture** pattern for data lakehouse organiz
           │
           ▼
 2. STAGING (not a medallion layer, but useful for resilience)
-   /Volumes/skyops/raw/bts/staging/*.csv
+   /Volumes/skyops/bronze/bts/staging/*.csv
    - Monthly CSV files (resume-friendly)
    - 28,178,862 rows total
           │
           ▼
 3. BRONZE LAYER (/SkyOps/bronze/bts_ontime_ingest.py)
-   skyops.raw.bts_ontime
+   skyops.bronze.bts_ontime
    - Raw ingestion with schema enforcement
    - Partitioned by YEAR
    - FL_DATE as string (yyyyMMdd)
@@ -188,7 +188,7 @@ SkyOps follows the **Medallion Architecture** pattern for data lakehouse organiz
 
 ```
 skyops (catalog)
-├── raw (schema)                    ← Bronze layer output
+├── bronze (schema)                 ← Bronze layer output
 │   ├── bts (volume)                ← Staging CSVs stored here
 │   │   └── staging/*.csv
 │   └── bts_ontime (table)          ← Bronze Delta table
@@ -242,7 +242,7 @@ skyops (catalog)
 | Gold   | 🔲 Planned | 0 | 0 |
 
 ### Completed
-* ✅ Bronze: `skyops.raw.bts_ontime` (28.2M rows, Feb 2022 - Feb 2026)
+* ✅ Bronze: `skyops.bronze.bts_ontime` (28.2M rows, Feb 2022 - Feb 2026)
 * ✅ Folder structure: bronze/, silver/, gold/
 * ✅ Documentation: README files in each layer
 
