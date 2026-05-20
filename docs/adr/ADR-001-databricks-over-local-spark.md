@@ -8,7 +8,7 @@
 
 ## Context
 
-SkyOps processes ~29 million BTS flight records across 5 years, joins with NOAA METAR weather data at the hourly level, and serves a Power BI dashboard from a Star Schema gold layer. The pipeline requires:
+SkyOps processes ~52.8 million BTS flight records across 7+ years (Jan 2019–Feb 2026), and in Iteration 2 will join with NOAA METAR weather data at the hourly level. It serves a Power BI dashboard from a Star Schema Gold layer. The pipeline requires:
 
 - Managed Spark execution for PySpark transformations at scale
 - Delta Lake with ACID transactions and time travel
@@ -29,7 +29,7 @@ The original stack considered was: Apache Spark running locally in Docker, with 
 - Familiar to candidates who have used tutorial stacks
 
 **Cons:**
-- Requires 32GB+ RAM machine to run meaningfully on 29M rows
+- Requires 32GB+ RAM machine to run meaningfully on 52.8M rows
 - MinIO setup and maintenance is significant non-pipeline work
 - Unity Catalog is not available outside Databricks — no lineage, no column-level access
 - Cannot demonstrate cloud cost management (a differentiator in senior interviews)

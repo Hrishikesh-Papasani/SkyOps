@@ -8,7 +8,7 @@
 
 ## Context
 
-`fact_flights` is the central Gold table. It contains ~29 million rows when fully loaded (2019–2023) and grows by ~500,000 rows per month as new BTS data arrives. It is refreshed by the `skyops_gold_refresh` Lakeflow job after each Silver pipeline run.
+`fact_flights` is the central Gold table. It contains ~52.8 million rows when fully loaded (Jan 2019–Feb 2026) and grows by ~550,000 rows per month as new BTS data arrives. It is refreshed by the `skyops_gold_refresh` Lakeflow job after each Silver pipeline run.
 
 Two materialisation strategies were evaluated for the dbt `fact_flights` model:
 1. **Full refresh** — truncate and reload the entire table on every pipeline run
@@ -29,10 +29,10 @@ The choice affects: runtime, cost, historical data preservation, and handling of
 - Easier to reason about correctness
 
 **Cons:**
-- Processing 29M rows on every run is expensive and slow on Databricks SQL Warehouse
-  - Estimated full refresh time: 25–35 minutes on 2X-Small serverless warehouse
-  - Cost per full refresh: ~$0.80 on SQL Warehouse at serverless pricing
-  - Monthly cost for 4 runs: ~$3.20 (acceptable but unnecessary)
+- Processing 52.8M rows on every run is expensive and slow on Databricks SQL Warehouse
+  - Estimated full refresh time: 35–45 minutes on 2X-Small serverless warehouse
+  - Cost per full refresh: ~$1.10 on SQL Warehouse at serverless pricing
+  - Monthly cost for 4 runs: ~$4.40 (acceptable but unnecessary)
 - Cannot use `OPTIMIZE` and `ZORDER` incrementally — full table rewrite on each run
 - Overwrites historical data — no Delta time travel benefit between runs
 - All 29M rows scanned every run, even when only 500K rows changed
@@ -69,7 +69,7 @@ Configuration:
         'data_type': 'date',
         'granularity': 'month'
     },
-    cluster_by=['airline_code', 'origin_iata']
+    cluster_by=['airline_code', 'origin_airport_id']
 ) }}
 ```
 
@@ -83,7 +83,21 @@ WHERE to_date(FL_DATE, 'yyyyMMdd') >=
 
 **Rationale for 35 days (not 30):** BTS data corrections have been observed up to 30 days after initial publication. 5-day buffer provides safety margin without scanning significantly more data.
 
-**Surrogate key collision check:** `flight_id = md5(FL_DATE || AIRLINE_CODE || FL_NUMBER || ORIGIN || DEST || CRS_DEP_TIME)`. The combination of these six fields is unique per BTS data dictionary — a flight cannot have the same airline, flight number, route, and scheduled departure time twice on the same date. Verified with `dbt test unique: flight_id` on full 2022 dataset (0 violations).
+**Surrogate key design:** The `flight_id` is a 7-column business key, not an MD5 hash, to keep it human-readable and debuggable:
+
+```sql
+CONCAT_WS('_',
+  FL_DATE,
+  AIRLINE_CODE,
+  CAST(FL_NUMBER AS STRING),
+  LPAD(CAST(CAST(CRS_DEP_TIME AS INT) AS STRING), 4, '0'),  -- normalised to 4 digits
+  CAST(OriginAirportID AS STRING),
+  CAST(DestAirportID AS STRING),
+  COALESCE(Tail_Number, '')  -- NULL → empty string for cancelled flights
+) AS flight_id
+```
+
+The combination of these 7 fields is unique per BTS data — validated with a full dataset deduplication test in `silver/BTS Primary Key resolution.ipynb` (52,864,767 rows → 52,864,767 distinct keys, 0 duplicates). `CRS_DEP_TIME` is normalised to 4-digit padded format before inclusion to prevent key drift if BTS changes padding behaviour. `Tail_Number` resolves the one edge case (YX 3624, June 2018) where the same flight identity had two aircraft due to an emergency substitution.
 
 ---
 
@@ -92,8 +106,8 @@ WHERE to_date(FL_DATE, 'yyyyMMdd') >=
 **Positive:**
 - Monthly pipeline runtime: 4–8 minutes vs 25–35 minutes for full refresh
 - Delta MERGE ensures ACID correctness — no duplicate rows even on re-runs
-- Partition pruning on `fl_date` (month granularity) + clustering on `airline_code` / `origin_iata` enables Power BI queries to scan only relevant partitions
-- `OPTIMIZE ZORDER BY (airline_code, origin_iata)` runs in ~90 seconds on a monthly partition vs 15+ minutes on the full table
+- Partition pruning on `fl_date` (month granularity) + clustering on `airline_code` / `origin_airport_id` enables Power BI queries to scan only relevant partitions
+- `OPTIMIZE ZORDER BY (airline_code, origin_airport_id)` runs in ~90 seconds on a monthly partition vs 15+ minutes on the full table
 
 **Negative:**
 - If `flight_id` surrogate key generation logic changes, a full refresh is required

@@ -12,11 +12,14 @@ that ingests 7+ years of US domestic on-time performance data (Jan 2019 - Feb 20
 Transportation Statistics (BTS), enriches it with METAR weather observations, and
 delivers analytical Gold-layer models to Power BI.
 
-**Four business questions this platform answers:**
-1. Which routes have the worst on-time performance, and why?
-2. How do weather conditions correlate with delay severity by airport?
-3. Which carriers recover fastest from initial delays?
-4. How did COVID-19 reshape the US domestic network (2020-2022)?
+**Five problem domains this platform answers:**
+1. **Operations** — Where are we losing time and is it our fault? (controllable vs uncontrollable delay split, airborne recovery, taxi efficiency)
+2. **Route Planning** — Which routes and schedules are structurally broken? (block time padding, cascade by hour, route delay variance)
+3. **Airport Operations** — Which airports are systemic delay generators? (origin as injector, destination as amplifier, taxi outliers)
+4. **Fleet & Turnaround** — Is our aircraft utilisation efficient? (turnaround proxy via Tail_Number chain, cascade reconstruction)
+5. **Schedule Integrity** — How reliable is our published schedule? (cancellation patterns, Southwest Dec 2022 anomaly, diversion rates)
+
+**Iteration scope:** Iteration 1 uses BTS On-Time data only. METAR weather enrichment is deferred to Iteration 2.
 
 ---
 
@@ -39,10 +42,10 @@ SkyOps/
 │   ├── dbt_project.yml        ← Project config (profile=skyops, catalog=skyops)
 │   ├── profiles.yml           ← Databricks SQL Warehouse connection
 │   ├── packages.yml           ← dbt-utils, dbt_databricks_utils
-│   └── seeds/
-│       ├── airport_timezone.csv   ← 15 airports: IATA→ICAO→timezone_str (CRITICAL for METAR join)
-│       ├── airport_metadata.csv   ← 30 airports with hub class, coords, runway count
-│       └── airline_metadata.csv  ← 15 carriers with LCC flag, alliance, DOT code
+│   (seeds/)                   ← ❌ NOT YET BUILT
+│   │   airport_metadata.csv   ← 30 airports: bts_airport_id (PK), IATA, hub class, coords
+│   │   airline_metadata.csv   ← 15 carriers: LCC flag, alliance, DOT code
+│   │   airport_timezone.csv   ← 15 airports: IATA→ICAO→timezone_str (for Iteration 2 METAR join)
 │   (models/)                  ← ❌ NOT YET BUILT (staging/, marts/ subdirs needed)
 │
 ├── docs/
@@ -72,12 +75,12 @@ SkyOps/
 | `requirements.txt` | ✅ Complete | All dependencies declared |
 | `databricks.yml` | ✅ Complete | 4 Lakeflow Jobs as Asset Bundle |
 | `dbt/` config files | ✅ Complete | dbt_project.yml, profiles.yml, packages.yml |
-| `dbt/seeds/` | ✅ Complete | 3 seed files (timezone, airport, airline metadata) |
+| `dbt/seeds/` | ❌ Not built | CSV files do not exist on disk yet — directory is absent |
 | `docs/runbook.md` | ✅ Complete | 4 incidents documented |
-| `docs/adr/` | ✅ Complete | 5 ADRs |
+| `docs/adr/` | ✅ Complete | 6 ADRs (ADR-006 added: star schema design) |
 | `README.md` | ✅ Complete | Full architecture + quickstart |
 | `.gitignore` | ✅ Complete | data/, dbt artefacts, secrets excluded |
-| Bronze Delta table | ✅ Complete | skyops.bronze.bts_ontime — 46.8M rows, Jan 2019 - Feb 2026 |
+| Bronze Delta table | ✅ Complete | skyops.bronze.bts_ontime — 52.8M rows, Jan 2019 - Feb 2026 (verified via EDA) |
 
 ---
 
@@ -85,11 +88,13 @@ SkyOps/
 
 | Component | Priority | Notes |
 |-----------|----------|-------|
-| `ingestion/metar_downloader.py` | HIGH | IEM ASOS API, 15 airports, Jan 2019 - Feb 2026 |
-| `dbt/models/staging/` | HIGH | STG models for Bronze→Silver transformation |
-| `dbt/models/marts/` | HIGH | dim_airport, dim_airline, dim_date, fct_flights, fct_delay_cascade |
-| Databricks notebooks | MEDIUM | Bronze ingestion PySpark notebook (reads from Volumes) |
+| `dbt/seeds/` CSV files | HIGH | airport_metadata (needs bts_airport_id col), airline_metadata, airport_timezone |
+| `dbt/models/staging/stg_bts_flights.sql` | HIGH | Cast, compute dep_time_minutes, LPAD CRS_DEP_TIME, build flight_id |
+| `dbt/models/marts/` | HIGH | dim_date, dim_airport, dim_airline, dim_aircraft, fct_flights, fct_delay_cascade |
+| Aircraft dimension table | HIGH | Tail_Number → aircraft type/family; user will source and load separately |
+| Databricks Silver notebooks | HIGH | silver_flights.py (6 steps), cancelled-first rule (Incident #004) |
 | Great Expectations suite | MEDIUM | Data quality checkpoints |
+| `ingestion/metar_downloader.py` | LOW (Iteration 2) | IEM ASOS API, 15 airports — deferred until BTS-only iteration is complete |
 | Kafka producer | LOW | Structured Streaming path (optional for portfolio) |
 
 ---
@@ -215,17 +220,23 @@ The timezone mapping for METAR→local join is in `dbt/seeds/airport_timezone.cs
 Local Script          Databricks Unity Catalog
 ──────────            ────────────────────────────────────────────────
 bts_downloader.py ──► /Volumes/skyops/bronze/bts/staging/*.csv   (Raw CSVs)
-                       ↓  (Notebook: bronze/bts_ontime_ingest.py)
-                      skyops.bronze.bts_ontime                    (Delta table, 46.8M rows)
+                       ↓  (Notebook: bronze/bts_ontime_ingest.ipynb)
+                      skyops.bronze.bts_ontime                    (Delta table, 52.8M rows)
                        ↓  (Lakeflow Job: skyops_silver_quality)
-                      skyops.silver.fct_flights_clean             (GE validated)
-                       ↓  (Lakeflow Job: skyops_gold_refresh)
-                      skyops.gold.fct_flights                     (dbt incremental)
-                      skyops.gold.dim_airport
-                      skyops.gold.dim_airline
+                      skyops.silver.flights                       (non-cancelled, GE validated)
+                      skyops.silver.cancellations                 (cancelled rows, separated first)
+                      skyops.silver.quarantine                    (failed reconciliation)
+                       ↓  (Lakeflow Job: skyops_gold_refresh → dbt)
                       skyops.gold.dim_date
+                      skyops.gold.dim_airport                     (keyed on bts_airport_id)
+                      skyops.gold.dim_airline
+                      skyops.gold.dim_aircraft                    (keyed on tail_number)
+                      skyops.gold.fct_flights                     (dbt incremental, 52.8M rows)
+                      skyops.gold.fct_delay_cascade               (cascade pairs via Tail_Number)
                        ↓
                       Power BI (Import mode, SQL Warehouse)
+                        └─ dim_origin_airport  (view of dim_airport, active rel on origin_airport_id)
+                        └─ dim_dest_airport    (view of dim_airport, active rel on dest_airport_id)
 ```
 
 **Data Coverage**:
@@ -268,25 +279,55 @@ DBT_TOKEN=<databricks-personal-access-token>
 
 8. **BTS website changes**: The BTS TranStats website occasionally changes its layout. If the script fails with "Could not find 'Latest Available Data'", use the `--month` argument to specify exact months instead of relying on `--years` auto-detection.
 
+9. **ORIGIN IATA code is not downloaded**: The BTS download selected `ORIGIN_CITY_NAME` (city string) and `ORIGIN_AIRPORT_ID` (BTS numeric ID) but not `ORIGIN` (the 3-letter IATA code). `DEST` is available as IATA. **Resolution**: `dim_airport` is keyed on `bts_airport_id` (the numeric), so `fct_flights` carries `origin_airport_id` and `dest_airport_id` as integer FKs. No re-download needed. Do NOT attempt to derive ORIGIN IATA in the fact table — join to `dim_airport` instead.
+
+10. **CRS_DEP_TIME is an unpadded string**: Stored as `"800"` for 08:00, `"2007"` for 20:07. The `flight_id` surrogate key includes `CRS_DEP_TIME`. Normalise to 4-digit padded string with `LPAD(CAST(CAST(CRS_DEP_TIME AS INT) AS STRING), 4, '0')` in `stg_bts_flights.sql` before building the key, or the same flight will have a different key if BTS ever changes padding. The `dep_time_minutes` column (used for cascade join ordering) must also be derived from the padded form.
+
 ---
 
 ## 11. dbt Models — What Needs To Be Built
 
-### Staging layer (`skyops.silver`, materialized as `view`)
-- `stg_bts_flights.sql` — select + cast from `skyops.bronze.bts_ontime`
-- `stg_metar_obs.sql` — select + cast from `skyops.bronze.metar_raw`
+### Design: Star Schema (not a flat fact table)
+46.8M rows denormalised with airport/airline attributes would be 15–20GB in Power BI Import mode. The star schema keeps `fct_flights` slim with integer FK joins. See ADR-006.
 
-### Marts layer (`skyops.gold`, materialized as `table` or `incremental`)
-- `dim_date.sql` — date spine from 2019-01-01 to 2026-12-31
-- `dim_airport.sql` — from `ref('airport_metadata')` seed
-- `dim_airline.sql` — from `ref('airline_metadata')` seed
-- `fct_flights.sql` — incremental, joins stg_bts_flights + stg_metar_obs, unique_key='flight_id'
-- `fct_delay_cascade.sql` — self-join on TAIL_NUM + date to find propagated delays
+### Grain of `fct_flights`
+One row per **scheduled flight leg** — including cancelled flights (flagged, NULL delay metrics, not excluded). Grain enforced by surrogate key.
+
+### Surrogate Key (proven, 0 duplicates on 52.8M rows)
+```sql
+CONCAT_WS('_',
+  FL_DATE,
+  AIRLINE_CODE,
+  CAST(FL_NUMBER AS STRING),
+  LPAD(CAST(CAST(CRS_DEP_TIME AS INT) AS STRING), 4, '0'),  -- normalised to 4 digits
+  CAST(OriginAirportID AS STRING),
+  CAST(DestAirportID AS STRING),
+  COALESCE(Tail_Number, '')  -- NULL → empty string for cancelled flights
+) AS flight_id
+```
+Each column's necessity was validated via EDA in `silver/BTS Primary Key resolution.ipynb`.
+
+### Staging layer (materialized as `view`)
+- `stg_bts_flights.sql` — cast types; LPAD CRS_DEP_TIME; compute `dep_time_minutes`, `dep_hour`, `flight_id`; derive boolean flags
+- `stg_metar_obs.sql` — **Iteration 2 only** (METAR not yet downloaded)
+
+### Marts layer (materialized as `table` or `incremental`)
+- `dim_date.sql` — `dbt_utils.date_spine` from `2019-01-01` to `2026-12-31`; flags: `is_covid_period`, `day_of_week`, `month_name`, `is_weekend`
+- `dim_airport.sql` — from `airport_metadata` seed; **primary key is `bts_airport_id`** (numeric), not IATA; includes `iata_code`, `airport_name`, `city`, `state`, `hub_classification`, `lat`, `lon`
+- `dim_airline.sql` — from `airline_metadata` seed; keyed on `airline_code` (IATA string)
+- `dim_aircraft.sql` — from aircraft dimension table loaded separately; keyed on `tail_number`; includes aircraft type/family
+- `fct_flights.sql` — incremental, `unique_key='flight_id'`; FKs: `fl_date`, `origin_airport_id`, `dest_airport_id`, `airline_code`, `tail_number`; pre-computed measures: `is_on_time`, `is_dep_on_time`, `is_cancelled`, `controllable_delay_min`, `uncontrollable_delay_min`, `airborne_recovery_min`, `block_time_padding_min`, `dep_time_minutes`, `dep_hour`
+- `fct_delay_cascade.sql` — self-join on `Tail_Number + fl_date`, `ROW_NUMBER() OVER (PARTITION BY fl_date, tail_number ORDER BY dep_time_minutes)`. **NOT** on `airline_code + fl_number` (FL_NUMBER identifies a route-schedule, not a physical aircraft rotation). Excludes NULL Tail_Numbers (0.55% of records, 99.999% cancelled). See ADR-006 and Incident #003 correction.
+
+### Power BI role-playing dimensions
+`dim_airport` is imported twice as `dim_origin_airport` and `dim_dest_airport` (two dbt views selecting `* FROM dim_airport`). This gives Power BI two active relationships from `fct_flights` without bidirectional join complexity.
 
 ### dbt variables in scope (set in dbt_project.yml)
 ```yaml
 dim_date_start: "2019-01-01"
-dim_date_end: "2026-12-31"
+dim_date_end: "2026-12-31"          # covers full BTS data range
+covid_period_start: "2020-03-15"
+covid_period_end: "2021-06-01"
 delay_reporting_threshold_minutes: 15
 delay_reconciliation_tolerance_minutes: 2
 incremental_lookback_days: 35
@@ -297,15 +338,30 @@ max_freshness_days: 40
 
 ## 12. Suggested Next Steps (Priority Order)
 
-1. **Build METAR downloader** (`ingestion/metar_downloader.py`) — IEM ASOS API, Jan 2019 - Feb 2026.
+1. **Create `dbt/seeds/` CSV files** (HIGH):
+   - `airport_metadata.csv` — must include `bts_airport_id` column (BTS numeric ID, e.g. 10397 for ATL) as the join key to `OriginAirportID`/`DestAirportID` in Bronze
+   - `airline_metadata.csv` — keyed on `airline_code` (IATA string matching `AIRLINE_CODE` in Bronze)
+   - `airport_timezone.csv` — for Iteration 2 METAR join; can be created now but not used yet
 
-2. **Deploy Asset Bundle** to Databricks:
+2. **Load aircraft dimension table** to Databricks (source: FAA aircraft registry or similar); must be keyed on `Tail_Number` string.
+
+3. **Build dbt models** in DAG order:
+   ```
+   dbt seed
+   dbt run --select dim_date dim_airline dim_airport dim_aircraft
+   dbt run --select stg_bts_flights
+   dbt run --select fct_flights
+   dbt run --select fct_delay_cascade
+   dbt test
+   ```
+
+4. **Build Silver notebooks** (`notebooks/silver/silver_flights.py`) — follows 6-step pattern with cancelled-first separation (Incident #004 rule).
+
+5. **Deploy Asset Bundle** to Databricks:
    ```bash
    databricks bundle deploy --target prod
    ```
 
-3. **Build dbt models** (staging → marts) following schema in section 11 above.
+6. **Connect Power BI** — import `dim_origin_airport` and `dim_dest_airport` as two separate queries pointing to the same `dim_airport` table. Build dashboards for the 5 problem domains.
 
-4. **Connect Power BI** to Databricks SQL Warehouse and build dashboards for the 4 business questions.
-
-5. **Set up incremental refresh**: Configure Lakeflow Jobs to run monthly on new data arrivals.
+7. **METAR (Iteration 2)** — build `ingestion/metar_downloader.py`, then `stg_metar_obs.sql`, then enrich `fct_flights` with weather join.

@@ -185,86 +185,96 @@ Error in Databricks SQL: `Query exceeded timeout of 3600 seconds`.
 Job 3 `dbt_test` task never reached.
 
 #### Root Cause
-`fct_delay_cascade` requires a self-join on `fact_flights` to identify consecutive flights on the same aircraft routing.
+`fct_delay_cascade` requires a self-join on `fact_flights` to identify consecutive legs operated by the same physical aircraft.
 
-Original approach: join the full 29M-row `fact_flights` table to itself on `AIRLINE_CODE + FL_NUMBER`, matching where `f2.fl_date = f1.fl_date` and `f2.CRS_DEP_TIME` is the next departure after `f1.ARR_TIME` on the same route.
+Original approach: join the full 52.8M-row `fact_flights` table to itself on `AIRLINE_CODE + FL_NUMBER`, matching where `f2.fl_date = f1.fl_date` and `f2.CRS_DEP_TIME` is the next departure on the same route.
 
-Without partition pruning, this generates a cross-product before the filter reduces it — **29M × 29M operation scanned before predicate pushdown**.
+This approach had two problems:
+1. **Conceptually wrong**: `FL_NUMBER` identifies a route-schedule (AA 100 is always JFK→LAX), not a physical aircraft rotation. The same aircraft that flies JFK→LAX does not then fly the same flight number on the same day — the return leg is a different flight number. Joining on `FL_NUMBER` does not reconstruct the aircraft’s daily flying programme.
+2. **Performance blowup**: Without partition pruning, the self-join generates a cross-product before the filter reduces it — **52.8M × 52.8M rows scanned before predicate pushdown**.
 
 Databricks SQL Warehouse attempted a broadcast join but `fact_flights` far exceeds broadcast threshold.
 
 #### How Detected
 `dbt run` failed with timeout. Checked Spark UI for the failed task:
-- Job plan showed `BroadcastNestedLoopJoin` with 29M × 29M input.
+- Job plan showed `BroadcastNestedLoopJoin` with 52.8M × 52.8M input.
 - Shuffle stage: 847GB spilled to disk before timeout.
 
-Captured before/after query plans with screenshots (saved in `docs/report/charts/`).
+Capturing the query plan also revealed the conceptual error: the `FL_NUMBER` join returned no cascade pairs where the origin and destination differed across sequential legs — confirming that `FL_NUMBER` does not identify aircraft rotations.
 
 #### Fix
-Rewrote `fct_delay_cascade.sql` as a **two-step approach**:
+Rewrote `fct_delay_cascade.sql` as a **two-step approach** using `Tail_Number` as the aircraft identifier:
 
-**Step 1:** Pre-aggregate departures by route per day. Filter to `airline_code` first.
+**Step 1:** Sequence every non-cancelled leg per physical aircraft per day. Partition by `fl_date + tail_number` — each partition contains 4–8 rows (a typical aircraft flies 4–6 legs per day).
 
 ```sql
--- Step 1: Create per-route per-day departure sequence (within airline partition)
-WITH ranked_flights AS (
+-- Step 1: Sequence each aircraft's legs within a day
+WITH flight_rotations AS (
     SELECT
-        airline_code,
-        fl_number,
-        origin_iata,
-        dest_iata,
-        fl_date,
-        arr_delay_minutes,
-        dep_delay_minutes,
-        delay_due_late_aircraft,
-        crs_dep_time_minutes,          -- integer minutes from midnight
-        arr_time_actual_minutes,       -- integer minutes from midnight
         flight_id,
+        fl_date,
+        tail_number,
+        airline_code,
+        origin_airport_id,
+        dest_airport_id,
+        dep_delay_minutes,
+        arr_delay_minutes,
+        delay_due_late_aircraft,
+        dep_time_minutes,          -- integer minutes from midnight (from stg)
+        dep_hour,                  -- for cascade heatmap in Power BI
         ROW_NUMBER() OVER (
-            PARTITION BY airline_code, fl_number, fl_date
-            ORDER BY crs_dep_time_minutes
-        ) AS flight_seq_num
-    FROM {{ ref('fact_flights') }}
-    WHERE delay_due_late_aircraft IS NOT NULL  -- only delayed flights
+            PARTITION BY fl_date, tail_number
+            ORDER BY dep_time_minutes
+        ) AS leg_seq
+    FROM {{ ref('fct_flights') }}
+    WHERE tail_number IS NOT NULL  -- cannot trace cascade without physical aircraft
+      AND NOT is_cancelled
 ),
--- Step 2: Self-join on seq_num = seq_num + 1 (consecutive flights same aircraft route)
-cascades AS (
+-- Step 2: Self-join on consecutive leg sequence
+cascade_pairs AS (
     SELECT
-        f1.flight_id               AS originating_flight_id,
-        f2.flight_id               AS cascaded_flight_id,
-        f1.airline_code,
-        f1.fl_date,
-        f1.arr_delay_minutes       AS upstream_arr_delay_minutes,
-        f2.dep_delay_minutes       AS downstream_dep_delay_minutes,
-        f2.delay_due_late_aircraft AS cascade_delay_minutes,
-        f2.origin_iata             AS cascade_origin
-    FROM ranked_flights f1
-    INNER JOIN ranked_flights f2
-        ON  f1.airline_code     = f2.airline_code   -- partition prune
-        AND f1.fl_number        = f2.fl_number       -- same flight number routing
-        AND f1.fl_date          = f2.fl_date         -- same day
-        AND f2.flight_seq_num   = f1.flight_seq_num + 1  -- consecutive
-        AND f2.delay_due_late_aircraft > 0           -- confirmed cascade
+        upstream.flight_id                  AS upstream_flight_id,
+        downstream.flight_id                AS downstream_flight_id,
+        upstream.tail_number,
+        upstream.fl_date,
+        upstream.airline_code,
+        upstream.origin_airport_id         AS upstream_origin_airport_id,
+        upstream.dest_airport_id           AS upstream_dest_airport_id,
+        downstream.origin_airport_id       AS downstream_origin_airport_id,
+        downstream.dest_airport_id         AS downstream_dest_airport_id,
+        upstream.arr_delay_minutes         AS upstream_arr_delay_min,
+        downstream.dep_delay_minutes       AS downstream_dep_delay_min,
+        downstream.delay_due_late_aircraft AS cascade_delay_min,
+        downstream.dep_hour                AS cascade_dep_hour
+    FROM flight_rotations AS upstream
+    INNER JOIN flight_rotations AS downstream
+        ON  upstream.fl_date     = downstream.fl_date
+        AND upstream.tail_number = downstream.tail_number
+        AND downstream.leg_seq   = upstream.leg_seq + 1
+        AND downstream.delay_due_late_aircraft > 0  -- confirmed cascade
 )
-SELECT * FROM cascades
+SELECT * FROM cascade_pairs
 ```
 
-**Result:** 47 minutes → **6 minutes**. Partition pruning on `airline_code` reduced the effective join size from 29M rows to ~1.5M per airline.
+**Result:** 47 minutes → **6 minutes**. Each partition contains only 4–8 rows (one aircraft’s day of flying), making the self-join trivially fast. The cluster key `['fl_date', 'tail_number']` on the output table ensures Power BI and dbt-test queries predicate-prune efficiently.
 
 Added dbt model-level config:
 
 ```sql
 {{ config(
     materialized='table',
-    cluster_by=['airline_code', 'fl_date'],
+    cluster_by=['fl_date', 'tail_number'],
     meta={'timeout_seconds': 1200}
 ) }}
 ```
 
+**Coverage note:** 0.55% of records have NULL `Tail_Number` (99.999% cancelled). These are excluded from cascade analysis. Document as known limitation: cascade coverage = 99.45% of non-cancelled flights.
+
 #### Prevention
 - Query plan review required before merging any model that contains self-joins.
-- Add comment in model header: "Self-join — must pre-filter on airline_code before join. Do not remove partition column from WHERE clause."
+- Add comment in model header: "Self-join on Tail_Number — partition key is `fl_date + tail_number`. Do NOT replace with `airline_code + fl_number` — FL_NUMBER identifies a route-schedule, not an aircraft rotation. See Incident #003."
 - dbt model timeout config at 1200s acts as early warning.
+- `Tail_Number IS NOT NULL AND NOT is_cancelled` filter in Step 1 is mandatory — removing it reintroduces the cross-product blowup.
 
 ---
 

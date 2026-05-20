@@ -48,8 +48,9 @@ The choice affects: dashboard interactivity speed, Databricks SQL Warehouse cost
 
 **Cons:**
 - Data is stale between refreshes — dashboard shows data as of last Gold pipeline run (acceptable for monthly BTS data)
-- Local machine RAM usage during refresh: ~2–4GB for 29M rows at Gold aggregation level
-  - Mitigated by connecting to pre-aggregated Gold tables, not Silver raw rows
+- Local machine RAM usage during refresh: ~1.5–2.5GB for 52.8M rows at Gold star schema level
+  - Mitigated by connecting to pre-aggregated Gold tables (star schema slim fact + small dims), not Silver raw rows
+  - `dim_airport` is imported twice as `dim_origin_airport` and `dim_dest_airport` (role-playing pattern) — adds negligible size since dim_airport is ~500 rows
 - Refresh requires SQL Warehouse to be running — but only for the duration of the refresh (~3–5 minutes), not continuously
 
 ### Option C — Composite Model (Import + DirectQuery mixed)
